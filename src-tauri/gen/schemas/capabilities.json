@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Minimum privileges for the Faiden window: invoke the app's own commands, listen for terminal events, and open a native folder picker on explicit user action.","local":true,"windows":["main"],"permissions":["core:default","core:event:allow-listen","core:event:allow-unlisten","core:window:allow-start-dragging","dialog:allow-open"]}}

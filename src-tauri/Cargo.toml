@@ -1,0 +1,39 @@
+[package]
+name = "faiden"
+version = "0.1.0"
+description = "Faiden — the agent-first terminal"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+
+[lib]
+name = "faiden_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+portable-pty = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+# Terminating a terminal's whole session (not just its leader) needs the raw
+# signal and process-enumeration calls.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
