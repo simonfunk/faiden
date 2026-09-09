@@ -4,7 +4,7 @@
 
 Faiden is an early, local-first desktop terminal built around enduring topics rather than mandatory Git worktrees or disposable model contexts. Start with a free-form thread; attach a directory and terminal when needed.
 
-> **Foundation, not a finished agent harness UI.** This build runs real shells. It does not yet integrate Hermes ACP, OpenClaw, automatic context rollover, remote hosts, tickets, semantic agent status, or agent-generated result ingestion. A handoff draft is not an AI session resume.
+> **Early build.** It runs real shells and can start a **new** Hermes ACP session. It does not import or resume existing Hermes/Warp sessions, and it has no OpenClaw adapter, context rollover, remote hosts or tickets. A handoff draft is not an AI session resume.
 
 ## Implemented foundation
 
@@ -15,6 +15,127 @@ Faiden is an early, local-first desktop terminal built around enduring topics ra
 - Editable handoff drafts with predecessor references; no automated AI summarization or hidden prompt submission.
 - Bounded retained output, streaming UTF-8 decoding, epoch/sequence correlation, lifecycle reconciliation and tested macOS terminal cleanup.
 - Browser preview explicitly disables native capabilities instead of simulating them.
+
+## Hermes agent sessions (ACP)
+
+A thread can own one **new** Hermes session over the Agent Client Protocol. Faiden
+spawns the Hermes you installed as `hermes acp` with piped stdio and speaks
+newline-delimited JSON-RPC to it.
+
+- **Real status, never inferred from liveness.** `connecting → ready → responding
+  → awaiting permission → cancelling → turn ended`, plus `disconnected` and
+  `error`, each derived from an actual request or event. A running process that
+  has not completed `initialize` *and* `session/new` is reported as *starting*,
+  not ready.
+- **A finished turn is not a success claim.** Faiden shows the literal ACP
+  `stopReason` (`end_turn`, `refusal`, `cancelled`, …) and says so in words.
+- **Approvals are shown as the agent sent them** — title, tool detail and the
+  exact options it offered — and only an offered option can be sent back.
+  Anything else fails closed to ACP's `cancelled` outcome: your own deadline
+  (shorter than Hermes's 60 s auto-deny), cancelling, stopping, quitting, a
+  request naming a session this run does not own, a request arriving with no
+  turn in flight, and an approval whose audit row could not be written.
+- **Streaming transcript** of assistant text, thinking and tool calls, persisted
+  in SQLite and bounded — a truncated tail says it is truncated.
+- **Sidebar attention** from real state: *Needs you* only for a genuinely pending
+  approval, plus a count of results you have not looked at yet.
+- **Cancel and stop** are explicit. Nothing is ever sent without pressing Send.
+
+### What it is not
+
+- **Not a sandbox.** The agent runs the Hermes you installed, with your user's
+  authority, your Hermes configuration and any MCP servers you configured
+  globally. Faiden removes inherited approval-bypass variables
+  (`HERMES_YOLO_MODE`, `HERMES_ACP_AUTO_APPROVE`, `HERMES_NONINTERACTIVE`,
+  `HERMES_EXEC_ASK`, `HERMES_CRON_SESSION`) before starting the child, and never
+  passes `--yolo` or any auto-approval flag. A bypass configured inside your own
+  `~/.hermes` config or `.env` is loaded by Hermes itself and is outside Faiden's
+  control.
+- **No installation, setup or sign-in.** If `hermes` is not found on `PATH`,
+  `~/.local/bin`, `~/.hermes/bin`, `/opt/homebrew/bin` or `/usr/local/bin`,
+  Faiden names every directory it searched and stops. Credentials stay with the
+  installed harness.
+- **No context reporting.** Faiden does not display a context budget or token
+  usage; the ACP `usage_update` variant is received but deliberately not shown,
+  because this build has not verified what it means.
+- **No question detection.** ACP has no clarification protocol. If Hermes asks
+  you something it arrives as ordinary assistant text and the turn ends with
+  `end_turn`; Faiden does not parse prose to guess that a question was asked.
+- **No import, load, resume, fork or model/mode switching.** `session/load`,
+  `session/resume`, `session/fork`, `session/set_model` and `session/set_mode`
+  are not used, so existing Hermes sessions cannot be attached.
+- **Agents do not survive quitting Faiden**, exactly like terminals. Interrupted
+  runs are reconciled as *disconnected* on the next start; nothing is reattached
+  and no prompt is ever replayed.
+- **Not yet exercised against a live provider by this build's own tests.** Every
+  automated test drives a labelled Python fixture peer over real pipes; no test
+  calls a model.
+
+## Session context and reviewed handoff
+
+Two questions the interface now answers with stored facts rather than guesses:
+*what is this session actually bound to*, and *what did Faiden actually supply*.
+
+- **Binding and launch directory are separate facts.** The context panel shows
+  the directory bound to the thread now, and, separately, the directory the
+  running agent was *started* in, with the executable path and how it was found.
+  Re-binding a thread does not move a live process, so when the two differ the
+  panel says so instead of showing one number for both.
+- **Freshness is labelled.** A binding that has not been inspected says so; one
+  whose directory has gone away says so; an inspected one carries the time it
+  was read. Branch and working-tree facts stay in the bar above and describe the
+  directory *now*, never what the agent saw at launch.
+- **Nothing is described in the present tense once it has ended.** With no live
+  run the panel either says nothing is running, or presents a past run as
+  explicitly historic, from Faiden's durable record.
+- **"What Faiden supplied" is exactly two things**: the briefing saved on the
+  owning session — *prepared text, not sent* — and the prompts you pressed Send
+  on, each carrying the durable status the native side recorded (`sent`,
+  `sending`, `not sent: …`). Saved notes, repository files, shell output and the
+  historical transcript are **not** supplied by Faiden and are never claimed to
+  be. Faiden also states that it cannot see Hermes' own system prompt, internal
+  or tool context, or model token usage. When the transcript read was itself a
+  bounded tail, the list is labelled as incomplete rather than presented as
+  everything that was sent.
+
+### Handoff: draft, review, start a **new** session
+
+A handoff is a human-authored briefing, composed locally and deterministically.
+
+- The draft is the native draft text (thread notes, predecessor session,
+  environment, editable *Goal / Decisions / Open tasks* placeholders) plus
+  verbatim excerpts, each labelled with the session, run and message id it was
+  copied from. Faiden does not summarise, infer or invent any of it.
+- **Bounds, stated in the draft itself**: at most the 3 most recent agent runs
+  are read, at most 8 excerpts are quoted (the newest; the count of older ones
+  dropped is printed), and each excerpt is cut at 600 characters with the cut
+  and the full length disclosed. The finished draft — notes, any previous
+  briefing and excerpts together — is bounded to the 40 000 Unicode code points
+  the database accepts for a briefing, counted the way the store counts them,
+  and a draft that had to be cut says so.
+- **Missing evidence is named, never shown as absence.** A transcript that could
+  not be read is reported as *unknown*, not as a run that said nothing; a
+  bounded transcript tail is reported as partial; agent runs beyond the read cap
+  are counted. A draft assembled from complete evidence carries none of these
+  notices.
+- **Excluded by rule and named in the text**: private agent reasoning
+  (`thought`), tool calls, tool output, standard error and permission payloads.
+  Only what you wrote and what the agent said back can be quoted.
+- Drafts are editable, saved as a `handoff-draft` session record, and can be
+  **reopened verbatim** after a thread switch or an app restart.
+- Starting from reviewed text creates a **new** `hermes-acp` session — never a
+  resume, load or import — stores the text as that session's briefing, records a
+  durable predecessor link inside the same thread (validated natively), and
+  places the text in the composer. **It is not sent.** Sending stays one
+  explicit press of Send, and edits made in the composer are what get sent.
+- **A retry never reuses the wrong text.** If a start is rejected and you then
+  edit the draft, Faiden closes the record it had created and makes a fresh one
+  carrying the corrected text and lineage; an unchanged retry reuses the record
+  it already made rather than leaving a duplicate.
+- A start is **blocked** while the thread still owns a live agent: Faiden never
+  interrupts a running session for you. Viewing, saving or starting sends
+  nothing; a rejected start keeps the draft on screen and retries into the same
+  session rather than leaving a second one behind.
 
 ## Development
 
@@ -69,17 +190,20 @@ Quit the existing app before replacing its installed bundle. Do not install anot
 - Starting a shell runs your local login shell with your user's authority and shell configuration. This is **not a sandbox**.
 - Notes and session metadata persist in plaintext SQLite at `~/Library/Application Support/dev.faiden.app/faiden.sqlite3` on macOS. Runtime terminal scrollback is bounded and not a durable full transcript.
 - Incomplete persisted terminal runs are reconciled as unknown after restart; they are not presented as live agents.
+- Agent transcripts, approval requests and their answers are persisted in the same plaintext SQLite database. Prompts you type are stored; model output is stored as it streams.
+- One Hermes child process per agent session, so two threads cannot contaminate each other's cwd or approval state. Quitting Faiden ends them.
 - Corrupt/unavailable storage fails rather than silently recreating an empty database. Back up the data directory before manual recovery; there is no recovery UI yet.
 
 ## Roadmap
 
 1. Stabilize native lifecycle, terminal usability and keyboard workflows.
-2. Add a permission-aware Hermes ACP adapter with honest new/load/handoff semantics and exclusive session ownership.
-3. Add actionable results/decisions and attention views, independent of execution state.
+2. Extend the Hermes ACP adapter beyond new sessions: honest load/resume semantics, context budget from advertised metrics, model and mode selection.
+3. Deepen actionable results/decisions and attention views, independent of execution state.
 4. Carry brainstorming into linked tickets and worktrees without changing the thread's identity.
 5. Add OpenClaw/other adapters, remote execution and verified Windows/Linux support.
 
-See [CONCEPT.md](CONCEPT.md) and the [foundation plan](docs/plans/0001-foundation.md).
+See [CONCEPT.md](CONCEPT.md), the [foundation plan](docs/plans/0001-foundation.md)
+and the [Hermes ACP plan](docs/plans/0002-hermes-acp.md).
 
 ## Publication status
 

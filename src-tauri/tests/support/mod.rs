@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod agent_fixture;
+
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -197,4 +199,28 @@ pub fn pgid_of(pid: u32) -> Option<u32> {
         .output()
         .expect("run ps");
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Waits until at least `count` review items exist for `thread_id`.
+pub fn wait_for_items(
+    store: &faiden_lib::store::Store,
+    thread_id: &str,
+    count: usize,
+) -> Vec<faiden_lib::store::ReviewItem> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let items = store
+            .list_review_items(thread_id)
+            .expect("list review items");
+        if items.len() >= count {
+            return items;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "only {} review item(s) appeared, expected {count}",
+                items.len()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

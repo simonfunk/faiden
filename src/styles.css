@@ -232,6 +232,28 @@ p {
   color: var(--accent);
 }
 
+/* Real agent state, derived from the protocol — never from a live process. */
+.thread-item__agent {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+}
+
+.thread-item__agent--attention {
+  color: var(--warn);
+}
+
+.thread-item__agent--live {
+  color: var(--text-dim);
+}
+
+/* Results the agent produced that nobody has looked at yet. Independent of the
+   thread's own seen/reviewed state, which records what a human did. */
+.thread-item__unseen {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--accent);
+}
+
 /* --- workspace ------------------------------------------------------------ */
 
 .workspace {
@@ -616,6 +638,15 @@ p {
   background: var(--text-faint);
 }
 
+.dot--idle {
+  background: var(--accent-dim);
+}
+
+/* Amber, not green: the agent is blocked and a human has to answer. */
+.dot--attention {
+  background: var(--warn);
+}
+
 .terminal__caveat,
 .terminal__unavailable {
   font-size: 11.5px;
@@ -659,4 +690,296 @@ p {
   * {
     transition: none !important;
   }
+}
+
+/* --- agent ---------------------------------------------------------------- */
+
+.agent__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.agent__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent__pid,
+.agent__cwd-inline {
+  color: var(--text-faint);
+}
+
+.agent__detail {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.agent__cwd,
+.agent__disclosure,
+.agent__truncated,
+.agent__resolution,
+.agent__ended {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.agent__unavailable {
+  font-size: 11.5px;
+  color: var(--warn);
+}
+
+.agent__truncated {
+  color: var(--warn);
+}
+
+.agent__transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  max-height: 380px;
+  overflow-y: auto;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  scrollbar-width: thin;
+}
+
+.agent__transcript:empty {
+  display: none;
+}
+
+.agent__entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent__role {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.agent__entry--user .agent__role {
+  color: var(--accent);
+}
+
+.agent__body {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.agent__entry--thought .agent__body,
+.agent__entry--tool .agent__body {
+  color: var(--text-dim);
+}
+
+.agent__entry-status {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* An approval request is the one place amber is load-bearing: the agent is
+   blocked until a human answers, and silence is answered as "not allowed". */
+.agent__permission {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: #1a1608;
+  padding: 9px 10px;
+}
+
+.agent__permission h3 {
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.agent__permission-title {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.agent__permission-detail {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-dim);
+}
+
+.agent__permission-note {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.agent__permission-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agent__deny {
+  border-color: var(--line-strong);
+  color: var(--danger);
+}
+
+.agent__composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.agent__composer .field {
+  width: 100%;
+}
+
+/* --- session context ------------------------------------------------------ */
+
+.context-panel {
+  gap: 9px;
+}
+
+.context-panel__block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.context-panel__block h3 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0;
+}
+
+.context-panel__block h4 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin: 6px 0 0;
+}
+
+.context-panel__muted {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.context-panel__warn {
+  font-size: 11.5px;
+  color: var(--warn);
+}
+
+.context-panel__path {
+  overflow-wrap: anywhere;
+}
+
+.context-panel__facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.context-panel__facts dt {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.context-panel__facts dd {
+  margin: 0;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.context-panel__briefing {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.context-panel__text {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.context-panel__prompts {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.context-panel__state {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.context-panel__state--sent {
+  color: var(--ok);
+}
+
+.context-panel__state--sending {
+  color: var(--accent);
+}
+
+.context-panel__state--failed {
+  color: var(--danger);
+}
+
+.handoff__origin,
+.handoff__note {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.handoff__blocked {
+  font-size: 11.5px;
+  color: var(--warn);
+}
+
+.session__foot {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.agent__prefilled {
+  font-size: 11.5px;
+  color: var(--accent);
 }

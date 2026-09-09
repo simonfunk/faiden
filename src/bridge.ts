@@ -10,6 +10,19 @@ import { listen } from '@tauri-apps/api/event'
 
 import { nativeUnavailableError, toAppError } from './domain/errors'
 import type {
+  AgentAvailability,
+  AgentCwd,
+  AgentDiagnostics,
+  AgentEvent,
+  AgentMessage,
+  AgentOverview,
+  AgentRunInfo,
+  AgentRunRecord,
+  AgentSnapshot,
+  AgentTranscript,
+  UnseenReviewCount,
+} from './domain/agentTypes'
+import type {
   AppInfo,
   DirectoryContext,
   ExitInfo,
@@ -25,6 +38,8 @@ import type {
 
 /** Matches `src-tauri/src/lib.rs::TERMINAL_EVENT`. */
 const TERMINAL_EVENT = 'faiden://terminal'
+/** Matches `src-tauri/src/lib.rs::AGENT_EVENT`. */
+const AGENT_EVENT = 'faiden://agent'
 
 export function isNativeAvailable(): boolean {
   return typeof globalThis !== 'undefined' && '__TAURI_INTERNALS__' in globalThis
@@ -62,6 +77,7 @@ export interface FaidenApi {
     summary: string,
   ): Promise<ReviewItem>
   reviewMarkReviewed(id: string): Promise<ReviewItem>
+  reviewUnseenCounts(): Promise<UnseenReviewCount[]>
   environmentInspect(path: string): Promise<DirectoryContext>
   environmentPickDirectory(): Promise<string | null>
   terminalStart(
@@ -76,6 +92,25 @@ export interface FaidenApi {
   terminalList(): Promise<TerminalInfo[]>
   terminalClose(terminalId: string): Promise<ExitInfo>
   onTerminalEvent(handler: (event: TerminalEvent) => void): Promise<() => void>
+
+  agentAvailability(): Promise<AgentAvailability>
+  agentPlannedCwd(threadId: string): Promise<AgentCwd>
+  agentStart(sessionId: string): Promise<AgentRunInfo>
+  agentList(): Promise<AgentRunInfo[]>
+  agentOverview(): Promise<AgentOverview[]>
+  agentSnapshot(runId: string): Promise<AgentSnapshot>
+  agentPrompt(runId: string, text: string): Promise<AgentMessage>
+  agentAnswerPermission(
+    runId: string,
+    requestId: string,
+    optionId: string | null,
+  ): Promise<void>
+  agentCancel(runId: string): Promise<AgentRunInfo>
+  agentStop(runId: string): Promise<AgentRunInfo>
+  agentDiagnostics(runId: string): Promise<AgentDiagnostics>
+  agentHistory(sessionId: string): Promise<AgentRunRecord[]>
+  agentTranscript(runId: string): Promise<AgentTranscript>
+  onAgentEvent(handler: (event: AgentEvent) => void): Promise<() => void>
 }
 
 export const api: FaidenApi = {
@@ -100,6 +135,7 @@ export const api: FaidenApi = {
   reviewAdd: (threadId, sessionId, kind, summary) =>
     call('review_add', 'add a review item', { threadId, sessionId, kind, summary }),
   reviewMarkReviewed: (id) => call('review_mark_reviewed', 'mark an item reviewed', { id }),
+  reviewUnseenCounts: () => call('review_unseen_counts', 'count results waiting to be read'),
 
   environmentInspect: (path) => call('environment_inspect', 'inspect a directory', { path }),
   environmentPickDirectory: () => call('environment_pick_directory', 'choose a directory'),
@@ -114,6 +150,30 @@ export const api: FaidenApi = {
     call('terminal_snapshot', 'read terminal output', { terminalId }),
   terminalList: () => call('terminal_list', 'list terminals'),
   terminalClose: (terminalId) => call('terminal_close', 'close a terminal', { terminalId }),
+
+  agentAvailability: () => call('agent_availability', 'check whether Hermes is installed'),
+  agentPlannedCwd: (threadId) =>
+    call('agent_planned_cwd', 'read where an agent would start', { threadId }),
+  agentStart: (sessionId) => call('agent_start', 'start a Hermes agent session', { sessionId }),
+  agentList: () => call('agent_list', 'list agent sessions'),
+  agentOverview: () => call('agent_overview', 'read agent status for every thread'),
+  agentSnapshot: (runId) => call('agent_snapshot', 'read an agent session', { runId }),
+  agentPrompt: (runId, text) => call('agent_prompt', 'send a message to the agent', { runId, text }),
+  agentAnswerPermission: (runId, requestId, optionId) =>
+    call('agent_answer_permission', 'answer a permission request', { runId, requestId, optionId }),
+  agentCancel: (runId) => call('agent_cancel', 'cancel the current turn', { runId }),
+  agentStop: (runId) => call('agent_stop', 'stop the agent session', { runId }),
+  agentDiagnostics: (runId) => call('agent_diagnostics', 'read agent diagnostics', { runId }),
+  agentHistory: (sessionId) => call('agent_history', 'load past agent sessions', { sessionId }),
+  agentTranscript: (runId) => call('agent_transcript', 'load an agent transcript', { runId }),
+
+  async onAgentEvent(handler) {
+    if (!isNativeAvailable()) {
+      return () => undefined
+    }
+    const unlisten = await listen<AgentEvent>(AGENT_EVENT, (event) => handler(event.payload))
+    return () => unlisten()
+  },
 
   async onTerminalEvent(handler) {
     if (!isNativeAvailable()) {

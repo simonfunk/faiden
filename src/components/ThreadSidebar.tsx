@@ -1,10 +1,15 @@
 import { useState } from 'react'
 
 import { checkTitle } from '../domain/validation'
+import type { AgentOverview, UnseenReviewCount } from '../domain/agentTypes'
 import type { Thread } from '../domain/types'
 
 export interface ThreadSidebarProps {
   threads: Thread[]
+  /** Live agent runs, so the sidebar reflects real state rather than guessing. */
+  agents: AgentOverview[]
+  /** Results a human has not looked at yet, per thread. */
+  unseen: UnseenReviewCount[]
   selectedId: string | null
   disabled: boolean
   onSelect: (id: string) => void
@@ -18,8 +23,57 @@ function statusLabel(thread: Thread): string {
   return 'New'
 }
 
+/**
+ * What an agent on this thread is asking of the reader. Derived from protocol
+ * state: a pending permission genuinely blocks the agent, whereas a running
+ * turn asks for nothing.
+ *
+ * A run that has *ended* is not thereby uninteresting. A turn that finished, or
+ * one that failed, left something to read, and an ended run is exactly the case
+ * where no further event will ever arrive to re-announce it. Such a run keeps
+ * saying so until the human explicitly reviews the thread — the one act that
+ * means "I have looked at this". A run that merely disconnected makes no result
+ * claim, so it says nothing.
+ *
+ * Live state always outranks review state: a reviewed thread whose agent is now
+ * blocked on an approval still says so.
+ */
+function agentBadge(
+  agents: AgentOverview[],
+  threadId: string,
+  reviewed: boolean,
+): string | null {
+  const mine = agents.filter((a) => a.threadId === threadId)
+  const live = mine.filter((a) => a.endedAt === null)
+
+  if (live.some((a) => a.awaitingPermission)) return 'Needs you'
+  if (live.some((a) => a.status === 'responding' || a.status === 'cancelling')) return 'Working'
+  if (live.some((a) => a.status === 'connecting')) return 'Starting'
+  if (mine.some((a) => a.status === 'turnComplete' || a.status === 'error')) {
+    return reviewed ? null : 'Has a result'
+  }
+  if (live.length > 0) return 'Agent ready'
+  return null
+}
+
+function AgentBadge({ label }: { label: string | null }) {
+  if (label === null) return null
+  return (
+    <span
+      className={`thread-item__agent thread-item__agent--${
+        label === 'Needs you' ? 'attention' : 'live'
+      }`}
+      data-testid="thread-agent"
+    >
+      {label}
+    </span>
+  )
+}
+
 export function ThreadSidebar({
   threads,
+  agents,
+  unseen,
   selectedId,
   disabled,
   onSelect,
@@ -98,6 +152,14 @@ export function ThreadSidebar({
                 onClick={() => onSelect(t.id)}
               >
                 <span className="thread-item__title">{t.title}</span>
+                {(unseen.find((u) => u.threadId === t.id)?.unseen ?? 0) > 0 ? (
+                  <span className="thread-item__unseen" data-testid="thread-unseen">
+                    {unseen.find((u) => u.threadId === t.id)?.unseen} new
+                  </span>
+                ) : null}
+                <AgentBadge
+                  label={agentBadge(agents, t.id, t.reviewedAt !== null)}
+                />
                 <span
                   className={`thread-item__status thread-item__status--${
                     t.reviewedAt !== null ? 'reviewed' : t.seenAt !== null ? 'seen' : 'new'

@@ -8,10 +8,11 @@ const mocks = vi.hoisted(() => {
     writes: string[]
     reset: ReturnType<typeof vi.fn>
     dispose: ReturnType<typeof vi.fn>
+    dataHandler: ((data: string) => void) | null
   }> = []
   let eventHandler: ((event: TerminalEvent) => void) | null = null
   const api = {
-    terminalWrite: vi.fn(async () => undefined),
+    terminalWrite: vi.fn(async (_terminalId: string, _data: string) => undefined),
     terminalResize: vi.fn(async () => undefined),
     terminalSnapshot: vi.fn(),
     onTerminalEvent: vi.fn(async (handler: (event: TerminalEvent) => void) => {
@@ -48,7 +49,11 @@ vi.mock('@xterm/xterm', () => ({
     open = vi.fn()
     focus = vi.fn()
     write = (data: string) => this.writes.push(data)
-    onData = vi.fn(() => ({ dispose: vi.fn() }))
+    dataHandler: ((data: string) => void) | null = null
+    onData = vi.fn((handler: (data: string) => void) => {
+      this.dataHandler = handler
+      return { dispose: vi.fn() }
+    })
   },
 }))
 
@@ -136,5 +141,61 @@ describe('XtermSurface sequence recovery', () => {
 
     expect(oldTerminal?.reset).not.toHaveBeenCalled()
     expect(oldTerminal?.writes).toEqual([])
+  })
+})
+
+describe('XtermSurface input', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    mocks.api.terminalWrite.mockReset()
+    mocks.api.terminalWrite.mockImplementation(async () => undefined)
+    mocks.api.terminalSnapshot.mockReset()
+    mocks.terminals.splice(0)
+  })
+
+  it('sends keystrokes in the order they were typed, even when a write is slow', async () => {
+    const first = deferred<undefined>()
+    mocks.api.terminalWrite.mockReturnValueOnce(first.promise).mockResolvedValue(undefined)
+    mocks.api.terminalSnapshot.mockResolvedValueOnce(snapshot('term-a'))
+    render(<XtermSurface terminalId="term-a" epoch={1} />)
+    await act(async () => {})
+
+    const type = mocks.terminals[0]?.dataHandler
+    await act(async () => {
+      type?.('a')
+      type?.('b')
+    })
+
+    // The second keystroke waits: an out-of-order arrival would reorder the
+    // user's own input.
+    expect(mocks.api.terminalWrite).toHaveBeenCalledTimes(1)
+    await act(async () => first.resolve(undefined))
+    expect(
+      mocks.api.terminalWrite.mock.calls.map((call) => (call as unknown as string[])[1]),
+    ).toEqual(['a', 'b'])
+  })
+
+  it('stops writing once the process has exited instead of reporting an error at the user', async () => {
+    mocks.api.terminalSnapshot.mockResolvedValueOnce(snapshot('term-a'))
+    render(<XtermSurface terminalId="term-a" epoch={1} />)
+    await act(async () => {})
+
+    act(() => {
+      mocks.emit({
+        type: 'exit',
+        terminalId: 'term-a',
+        epoch: 1,
+        seq: 1,
+        exitCode: 0,
+        success: true,
+      })
+    })
+    mocks.api.terminalWrite.mockClear()
+
+    act(() => mocks.terminals[0]?.dataHandler?.('x'))
+    await act(async () => {})
+
+    expect(mocks.api.terminalWrite).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })

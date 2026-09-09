@@ -7,6 +7,17 @@ import { vi } from 'vitest'
 import type { Mock } from 'vitest'
 
 import type { FaidenApi } from '../bridge'
+import type {
+  AgentAvailability,
+  AgentEvent,
+  AgentMessage,
+  AgentOverview,
+  AgentRunInfo,
+  AgentRunRecord,
+  AgentSnapshot,
+  PermissionPrompt,
+  UnseenReviewCount,
+} from '../domain/agentTypes'
 
 import type {
   AppInfo,
@@ -33,6 +44,23 @@ export interface FakeApi {
   directories: Record<string, DirectoryContext>
   pickResult: string | null
   emit(event: TerminalEvent): void
+
+  // --- agents ---
+  agentAvailability: AgentAvailability
+  agentRuns: AgentRunInfo[]
+  agentMessages: AgentMessage[]
+  agentTruncated: boolean
+  agentPending: PermissionPrompt | null
+  agentNextSeq: number
+  agentOverviews: AgentOverview[]
+  agentHistory: AgentRunRecord[]
+  /** Per-run snapshots, so two sessions can hold distinct durable state. */
+  agentSnapshots: Record<string, AgentSnapshot>
+  unseenCounts: UnseenReviewCount[]
+  /** How many live agent-event listeners exist, so disposal can be asserted. */
+  agentListeners: number
+  emitAgent(event: AgentEvent): void
+
   api: FakeApiMocks
 }
 
@@ -48,11 +76,39 @@ export function makeFakeApi(seed: Partial<Pick<FakeApi, 'threads' | 'sessions' |
     directories: seed.directories ?? {},
     pickResult: null,
     emit: () => undefined,
+    agentAvailability: {
+      installed: true,
+      program: '/Users/example/.local/bin/hermes',
+      source: 'PATH entry /Users/example/.local/bin',
+      message: 'Hermes found at /Users/example/.local/bin/hermes.',
+      disclosure:
+        'This agent runs the Hermes you installed, with your user authority. It is not a sandbox.',
+    },
+    agentRuns: [],
+    agentMessages: [],
+    agentTruncated: false,
+    agentPending: null,
+    agentNextSeq: 1,
+    agentOverviews: [],
+    agentHistory: [],
+    agentSnapshots: {},
+    unseenCounts: [],
+    agentListeners: 0,
+    emitAgent: () => undefined,
     api: {} as FakeApiMocks,
   }
 
   const listeners = new Set<(e: TerminalEvent) => void>()
   state.emit = (event) => listeners.forEach((l) => l(event))
+
+  const agentListeners = new Set<(e: AgentEvent) => void>()
+  state.emitAgent = (event) => agentListeners.forEach((l) => l(event))
+
+  const agentRun = (runId: string): AgentRunInfo => {
+    const run = state.agentRuns.find((r) => r.runId === runId)
+    if (!run) throw { code: 'NOT_FOUND', message: `no agent run ${runId}`, entity: 'agent_run', id: runId }
+    return run
+  }
 
   const thread = (id: string): Thread => {
     const t = state.threads.find((x) => x.id === id)
@@ -212,6 +268,89 @@ export function makeFakeApi(seed: Partial<Pick<FakeApi, 'threads' | 'sessions' |
     onTerminalEvent: vi.fn(async (cb: (e: TerminalEvent) => void) => {
       listeners.add(cb)
       return () => listeners.delete(cb)
+    }),
+
+    reviewUnseenCounts: vi.fn(async () => [...state.unseenCounts]),
+
+    agentAvailability: vi.fn(async () => state.agentAvailability),
+    agentPlannedCwd: vi.fn(async (threadId: string) => ({
+      path: '/Users/example/project',
+      label: `/Users/example/project — the directory bound to this thread (${threadId})`,
+    })),
+    agentStart: vi.fn(async (sessionId: string) => {
+      const run: AgentRunInfo = {
+        runId: nextId('agr'),
+        sessionId,
+        epoch: state.agentRuns.length + 1,
+        pid: 5150,
+        program: state.agentAvailability.program ?? 'hermes',
+        source: state.agentAvailability.source ?? 'PATH',
+        cwd: '/Users/example/project',
+        acpSessionId: null,
+        status: 'connecting',
+        detail: null,
+        startedAt: 1,
+        endedAt: null,
+        promptInFlight: false,
+        disclosure: state.agentAvailability.disclosure,
+      }
+      state.agentRuns = [...state.agentRuns, run]
+      return run
+    }),
+    agentList: vi.fn(async () => [...state.agentRuns]),
+    agentOverview: vi.fn(async () => [...state.agentOverviews]),
+    agentSnapshot: vi.fn(async (runId: string): Promise<AgentSnapshot> => {
+      const own = state.agentSnapshots[runId]
+      if (own) return { ...own, messages: [...own.messages] }
+      return {
+        info: agentRun(runId),
+        messages: [...state.agentMessages],
+        truncated: state.agentTruncated,
+        pendingPermission: state.agentPending,
+        nextSeq: state.agentNextSeq,
+      }
+    }),
+    agentPrompt: vi.fn(async (runId: string, text: string): Promise<AgentMessage> => {
+      const sent: AgentMessage = {
+        id: nextId('msg'),
+        runId,
+        key: 'user:1',
+        role: 'user',
+        turn: 1,
+        body: text,
+        detail: null,
+        status: 'sent',
+        createdAt: 1,
+        updatedAt: 1,
+      }
+      state.agentMessages = [...state.agentMessages, sent]
+      return sent
+    }),
+    agentAnswerPermission: vi.fn(async () => undefined),
+    agentCancel: vi.fn(async (runId: string) => ({ ...agentRun(runId), status: 'cancelling' as const })),
+    agentStop: vi.fn(async (runId: string) => {
+      const stopped = { ...agentRun(runId), status: 'disconnected' as const, endedAt: 9 }
+      state.agentRuns = state.agentRuns.map((r) => (r.runId === runId ? stopped : r))
+      return stopped
+    }),
+    agentDiagnostics: vi.fn(async (runId: string) => ({
+      runId,
+      unmatchedReplies: 0,
+      protocolFaults: 0,
+      stderrTail: '',
+    })),
+    agentHistory: vi.fn(async () => [...state.agentHistory]),
+    agentTranscript: vi.fn(async () => ({
+      messages: [...state.agentMessages],
+      truncated: state.agentTruncated,
+    })),
+    onAgentEvent: vi.fn(async (cb: (e: AgentEvent) => void) => {
+      agentListeners.add(cb)
+      state.agentListeners = agentListeners.size
+      return () => {
+        agentListeners.delete(cb)
+        state.agentListeners = agentListeners.size
+      }
     }),
   }
 

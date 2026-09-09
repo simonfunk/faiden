@@ -80,11 +80,28 @@ export function XtermSurface({ terminalId, epoch, onExit }: XtermSurfaceProps) {
             resyncing = false
           })
       },
-      ...(onExit ? { onExit } : {}),
+      onExit: (exit) => {
+        // The process is gone: keystrokes have nowhere to go. Refusing them
+        // quietly is the truthful behaviour — turning each one into an error
+        // banner would blame the user for typing into a dead terminal.
+        exited = true
+        onExit?.(exit)
+      },
     })
 
+    let exited = false
+    // Writes are chained, so two fast keystrokes reach the pty in the order
+    // they were typed rather than racing each other through the IPC boundary.
+    let queue: Promise<void> = Promise.resolve()
+
     const dataSub = term.onData((data) => {
-      void api.terminalWrite(terminalId, data).catch((e) => setError(describeError(toAppError(e))))
+      if (exited) return
+      queue = queue.then(() => {
+        if (disposed || exited) return undefined
+        return api
+          .terminalWrite(terminalId, data)
+          .catch((e) => setError(describeError(toAppError(e))))
+      })
     })
 
     const pushSize = () => {

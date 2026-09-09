@@ -22,6 +22,15 @@ pub const LIMIT_LABEL_CHARS: usize = 200;
 pub const LIMIT_KIND_CHARS: usize = 64;
 pub const LIMIT_SUMMARY_CHARS: usize = 1_000;
 pub const LIMIT_PATH_CHARS: usize = 4_096;
+/// Upper bound on one persisted agent transcript entry. A chunk stream that
+/// exceeds it is refused rather than silently trimmed by SQLite.
+pub const LIMIT_AGENT_BODY_CHARS: usize = 200_000;
+pub const LIMIT_AGENT_DETAIL_CHARS: usize = 40_000;
+pub const LIMIT_AGENT_KEY_CHARS: usize = 200;
+/// Hard ceiling on how many transcript rows one read may return. The store owns
+/// this bound, not its caller: a `usize` above `i64::MAX` used to cast negative,
+/// and SQLite reads a negative `LIMIT` as "no limit at all".
+pub const LIMIT_AGENT_LIST_MAX: usize = 2_000;
 
 /// Stated verbatim on every generated handoff draft. This slice has no model
 /// integration at all, and the UI must never imply otherwise.
@@ -31,6 +40,12 @@ pub const OUTCOME_INTERRUPTED: &str =
     "unknown — Faiden exited without recording how this terminal ended";
 
 pub const HANDOFF_DISCLOSURE: &str = "This is a human-authored handoff draft. It does not resume an AI context: no model session was replayed, continued or contacted.";
+
+/// Recorded for an agent run that was still open when Faiden exited. Agents are
+/// owned by this application, so such a run belongs to a process that is gone.
+/// It is a lifecycle fact, never a claim that the work finished.
+pub const AGENT_OUTCOME_INTERRUPTED: &str =
+    "disconnected — Faiden exited while this agent session was running";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +96,93 @@ pub struct ReviewItem {
     pub reviewed_at: Option<i64>,
 }
 
+/// One owned `hermes acp` child process, bound to the Faiden session it serves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRun {
+    pub run_id: String,
+    pub session_id: String,
+    pub program: String,
+    /// The directory the child was started in. Not an observed tool cwd.
+    pub cwd: Option<String>,
+    /// The agent's own session id, known only once `session/new` answered.
+    pub acp_session_id: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessage {
+    pub id: String,
+    pub run_id: String,
+    /// Streaming identity: repeated chunks for one turn share a key.
+    pub key: String,
+    /// `user` | `agent` | `thought` | `tool` | `system`.
+    pub role: String,
+    pub turn: i64,
+    pub body: String,
+    /// JSON side-channel for tool calls (kind, raw input); never rendered raw.
+    pub detail: Option<String>,
+    pub status: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The fields of a transcript entry, passed as one value so streaming callers
+/// read as data rather than as a long positional argument list.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentMessageDraft<'a> {
+    pub key: &'a str,
+    pub role: &'a str,
+    pub turn: i64,
+    pub body: &'a str,
+    pub detail: Option<&'a str>,
+    pub status: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPermissionRecord {
+    pub id: String,
+    pub run_id: String,
+    pub title: String,
+    pub detail: String,
+    /// The offered options, verbatim JSON as the agent sent them.
+    pub options: String,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+    pub resolution: Option<String>,
+}
+
+/// Results waiting to be looked at on one thread. Independent of the thread's
+/// own seen/reviewed state, which records what a human did rather than what an
+/// agent produced afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnseenReviewCount {
+    pub thread_id: String,
+    pub unseen: i64,
+}
+
+/// How a permission request ended. `Cancelled` is ACP's spelling for "not
+/// allowed" and is what every fail-closed path records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentPermissionResolution {
+    Selected { option_id: String },
+    Cancelled,
+}
+
+impl AgentPermissionResolution {
+    pub fn as_record(&self) -> String {
+        match self {
+            AgentPermissionResolution::Selected { option_id } => format!("selected:{option_id}"),
+            AgentPermissionResolution::Cancelled => "cancelled".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffDraft {
@@ -97,9 +199,6 @@ pub struct Store {
 }
 
 const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS threads (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
     id          TEXT NOT NULL UNIQUE,
@@ -152,11 +251,115 @@ CREATE TABLE IF NOT EXISTS terminal_runs (
 CREATE INDEX IF NOT EXISTS terminal_runs_open ON terminal_runs(ended_at);
 "#;
 
+/// Migration 2. Purely additive: it creates tables the foundation build never
+/// had and touches nothing that already exists, so an older database keeps
+/// every row it had.
+const SCHEMA_AGENT: &str = r#"
+-- One row per owned `hermes acp` child process.
+CREATE TABLE IF NOT EXISTS agent_runs (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         TEXT NOT NULL UNIQUE,
+    session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    program        TEXT NOT NULL,
+    cwd            TEXT,
+    acp_session_id TEXT,
+    started_at     INTEGER NOT NULL,
+    ended_at       INTEGER,
+    outcome        TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_runs_open ON agent_runs(ended_at);
+CREATE INDEX IF NOT EXISTS agent_runs_by_session ON agent_runs(session_id);
+
+-- Transcript. `key` is the streaming identity of an entry (an assistant turn,
+-- a tool call id), so repeated chunks update one row instead of appending
+-- thousands.
+CREATE TABLE IF NOT EXISTS agent_messages (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         TEXT NOT NULL UNIQUE,
+    run_id     TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    turn       INTEGER NOT NULL,
+    body       TEXT NOT NULL,
+    detail     TEXT,
+    status     TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(run_id, key)
+);
+CREATE INDEX IF NOT EXISTS agent_messages_by_run ON agent_messages(run_id, seq);
+
+-- What the agent asked permission for, and the single answer it received.
+CREATE TABLE IF NOT EXISTS agent_permission_requests (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          TEXT NOT NULL UNIQUE,
+    run_id      TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    detail      TEXT NOT NULL,
+    options     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    resolved_at INTEGER,
+    resolution  TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_permissions_by_run ON agent_permission_requests(run_id);
+"#;
+
+/// Migration 3. Makes "one live agent per session" a database invariant rather
+/// than a check some caller remembers to perform.
+///
+/// Two `AgentManager::start` calls for one session could both pass an
+/// in-memory registry check and then both insert, so both children ran and
+/// either could end the shared owning session underneath the other. A partial
+/// unique index is the only place that race can be decided once.
+///
+/// Any run still open when this runs belongs to a process that is gone — agents
+/// do not survive the application's exit — so settling them first is both
+/// truthful and what lets the index be created on an existing file.
+const SCHEMA_AGENT_SINGLE_OWNER: &str = r#"
+UPDATE agent_runs
+   SET ended_at = COALESCE(ended_at, strftime('%s','now') * 1000),
+       outcome  = COALESCE(outcome, 'disconnected — Faiden exited while this agent session was running')
+ WHERE ended_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_open_per_session
+    ON agent_runs(session_id) WHERE ended_at IS NULL;
+"#;
+
+/// Applied in order to whatever `PRAGMA user_version` the file reports. A
+/// foundation database is stamped 0 and already holds migration 1's tables;
+/// every statement is `IF NOT EXISTS`, so replaying it is a no-op rather than
+/// a failure.
+const MIGRATIONS: &[&str] = &[SCHEMA, SCHEMA_AGENT, SCHEMA_AGENT_SINGLE_OWNER];
+
 const THREAD_COLS: &str = "id, title, notes, workdir, created_at, updated_at, seen_at, reviewed_at";
 const SESSION_COLS: &str =
     "id, thread_id, label, kind, predecessor_id, briefing, created_at, ended_at, outcome";
 const REVIEW_COLS: &str =
     "id, thread_id, session_id, kind, summary, created_at, seen_at, reviewed_at";
+const AGENT_RUN_COLS: &str =
+    "run_id, session_id, program, cwd, acp_session_id, started_at, ended_at, outcome";
+const AGENT_MESSAGE_COLS: &str =
+    "id, run_id, key, role, turn, body, detail, status, created_at, updated_at";
+const AGENT_PERMISSION_COLS: &str =
+    "id, run_id, title, detail, options, created_at, resolved_at, resolution";
+
+/// Brings a database file up to the current schema, whatever version it is at.
+/// Every step is additive, so an older Faiden database keeps all of its rows.
+fn migrate(conn: &Connection) -> Result<(), AppError> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current < 0 || current as usize > MIGRATIONS.len() {
+        return Err(AppError::internal(format!(
+            "database reports schema version {current}, but this build only knows {}; \
+             refusing to touch it rather than risk destroying newer data",
+            MIGRATIONS.len()
+        )));
+    }
+    for (index, statements) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+        conn.execute_batch(statements)?;
+        conn.pragma_update(None, "user_version", (index + 1) as i64)?;
+    }
+    Ok(())
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, AppError> {
@@ -166,7 +369,10 @@ impl Store {
             }
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        // Pragmas stay outside the migration transaction: `journal_mode` cannot
+        // be changed from inside one.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        migrate(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
             clock: MonotonicClock::new(),
@@ -453,6 +659,289 @@ impl Store {
         })
     }
 
+    // --- agent runs ---------------------------------------------------------
+
+    /// Binds an agent run to the session it belongs to. Called *before* the
+    /// child is spawned, so an agent can never run without a durable owner.
+    pub fn start_agent_run(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        program: &str,
+        cwd: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
+        let run_id = validate_text("run_id", run_id, 1, LIMIT_LABEL_CHARS, true)?;
+        let program = validate_text("program", program, 1, LIMIT_PATH_CHARS, true)?;
+        let cwd = match cwd {
+            None => None,
+            Some(c) => Some(validate_text("cwd", c, 1, LIMIT_PATH_CHARS, true)?),
+        };
+        let now = self.clock.now_ms();
+        let conn = self.lock()?;
+        let session = require_session(&conn, session_id)?;
+        // A session ends once, for good. Reconciliation and a natural exit both
+        // end it, and neither may be undone by starting another agent under it.
+        if session.ended_at.is_some() {
+            return Err(AppError::conflict(
+                "SESSION_ENDED",
+                format!("session {session_id} has already ended; start a new session"),
+            ));
+        }
+        // The insert is the serialization point for "one live agent per
+        // session": `agent_runs_one_open_per_session` rejects the loser of a
+        // race here, across independent connections as well as threads.
+        conn.execute(
+            "INSERT INTO agent_runs (run_id, session_id, program, cwd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id, session_id, program, cwd, now],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(inner, _)
+                if inner.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                AppError::conflict(
+                    "AGENT_ALREADY_RUNNING",
+                    format!("session {session_id} already owns a running agent"),
+                )
+            }
+            other => AppError::from(other),
+        })?;
+        read_agent_run(&conn, &run_id)
+    }
+
+    /// Records the id the agent chose for its own session. Written once
+    /// `session/new` has actually answered, never before.
+    pub fn record_acp_session_id(
+        &self,
+        run_id: &str,
+        acp_session_id: &str,
+    ) -> Result<(), AppError> {
+        let value = validate_text("acp_session_id", acp_session_id, 1, LIMIT_LABEL_CHARS, true)?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE agent_runs SET acp_session_id = ?2 WHERE run_id = ?1",
+            params![run_id, value],
+        )?;
+        if changed == 0 {
+            return Err(AppError::not_found("agent_run", run_id));
+        }
+        Ok(())
+    }
+
+    pub fn get_agent_run(&self, run_id: &str) -> Result<AgentRun, AppError> {
+        let conn = self.lock()?;
+        read_agent_run(&conn, run_id)
+    }
+
+    pub fn list_agent_runs(&self, session_id: &str) -> Result<Vec<AgentRun>, AppError> {
+        let conn = self.lock()?;
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE session_id = ?1 ORDER BY seq ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![session_id], map_agent_run)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// First-writer-wins, exactly like a terminal run: a natural exit racing
+    /// the quit path cannot rewrite the outcome that was actually observed.
+    pub fn end_agent_run(&self, run_id: &str, outcome: &str) -> Result<(), AppError> {
+        let outcome = validate_text("outcome", outcome, 1, LIMIT_SUMMARY_CHARS, true)?;
+        let now = self.clock.now_ms();
+        let mut conn = self.lock()?;
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM agent_runs WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Err(AppError::not_found("agent_run", run_id));
+        };
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE agent_runs SET ended_at = COALESCE(ended_at, ?2), \
+             outcome = COALESCE(outcome, ?3) WHERE run_id = ?1",
+            params![run_id, now, outcome],
+        )?;
+        end_session_row(&tx, &session_id, now, &outcome)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Settles every agent run still marked open. Agents do not survive this
+    /// application's exit, so an open run at startup is a process that is gone.
+    /// Nothing is reattached and no prompt is replayed.
+    pub fn reconcile_interrupted_agent_runs(&self) -> Result<usize, AppError> {
+        let now = self.clock.now_ms();
+        let mut conn = self.lock()?;
+        let open: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT run_id, session_id FROM agent_runs WHERE ended_at IS NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row?);
+            }
+            v
+        };
+        let tx = conn.transaction()?;
+        for (run_id, session_id) in &open {
+            tx.execute(
+                "UPDATE agent_runs SET ended_at = ?2, outcome = COALESCE(outcome, ?3) \
+                 WHERE run_id = ?1",
+                params![run_id, now, AGENT_OUTCOME_INTERRUPTED],
+            )?;
+            // A permission request nobody could answer is settled closed, never
+            // as an allow.
+            tx.execute(
+                "UPDATE agent_permission_requests SET resolved_at = ?2, resolution = 'cancelled' \
+                 WHERE run_id = ?1 AND resolved_at IS NULL",
+                params![run_id, now],
+            )?;
+            end_session_row(&tx, session_id, now, AGENT_OUTCOME_INTERRUPTED)?;
+        }
+        tx.commit()?;
+        Ok(open.len())
+    }
+
+    // --- agent transcript ---------------------------------------------------
+
+    /// Inserts or updates the entry identified by `draft.key` within `run_id`.
+    pub fn upsert_agent_message(
+        &self,
+        run_id: &str,
+        draft: AgentMessageDraft<'_>,
+    ) -> Result<AgentMessage, AppError> {
+        let key = validate_text("key", draft.key, 1, LIMIT_AGENT_KEY_CHARS, true)?;
+        let role = validate_text("role", draft.role, 1, LIMIT_KIND_CHARS, true)?;
+        // Bodies keep their whitespace: they are verbatim model and tool output.
+        let body = validate_text("body", draft.body, 0, LIMIT_AGENT_BODY_CHARS, false)?;
+        let detail = match draft.detail {
+            None => None,
+            Some(d) => Some(validate_text(
+                "detail",
+                d,
+                0,
+                LIMIT_AGENT_DETAIL_CHARS,
+                false,
+            )?),
+        };
+        let status = match draft.status {
+            None => None,
+            Some(s) => Some(validate_text("status", s, 0, LIMIT_KIND_CHARS, true)?),
+        };
+        let now = self.clock.now_ms();
+        let id = new_id("msg");
+        let conn = self.lock()?;
+        require_agent_run(&conn, run_id)?;
+        conn.execute(
+            "INSERT INTO agent_messages \
+                 (id, run_id, key, role, turn, body, detail, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
+             ON CONFLICT(run_id, key) DO UPDATE SET \
+                 role = excluded.role, turn = excluded.turn, body = excluded.body, \
+                 detail = excluded.detail, status = excluded.status, \
+                 updated_at = excluded.updated_at",
+            params![id, run_id, key, role, draft.turn, body, detail, status, now],
+        )?;
+        let sql = format!(
+            "SELECT {AGENT_MESSAGE_COLS} FROM agent_messages WHERE run_id = ?1 AND key = ?2"
+        );
+        conn.query_row(&sql, params![run_id, key], map_agent_message)
+            .optional()?
+            .ok_or_else(|| AppError::not_found("agent_message", key))
+    }
+
+    /// The newest `limit` entries in chronological order, plus whether older
+    /// entries exist. Truncation is reported, never disguised as completeness.
+    ///
+    /// `limit` is clamped to [`LIMIT_AGENT_LIST_MAX`] here rather than trusted:
+    /// a caller-supplied `usize` above `i64::MAX` would otherwise cast negative,
+    /// and SQLite treats a negative `LIMIT` as unbounded.
+    pub fn list_agent_messages(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<AgentMessage>, bool), AppError> {
+        let limit = limit.min(LIMIT_AGENT_LIST_MAX);
+        let conn = self.lock()?;
+        require_agent_run(&conn, run_id)?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )?;
+        let sql = format!(
+            "SELECT {AGENT_MESSAGE_COLS} FROM agent_messages WHERE run_id = ?1 \
+             ORDER BY seq DESC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![run_id, limit as i64], map_agent_message)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
+        Ok((out, total > limit as i64))
+    }
+
+    // --- agent permission requests ------------------------------------------
+
+    pub fn record_permission_request(
+        &self,
+        id: &str,
+        run_id: &str,
+        title: &str,
+        detail: &str,
+        options: &str,
+    ) -> Result<AgentPermissionRecord, AppError> {
+        let id = validate_text("id", id, 1, LIMIT_LABEL_CHARS, true)?;
+        let title = validate_text("title", title, 0, LIMIT_SUMMARY_CHARS, false)?;
+        let detail = validate_text("detail", detail, 0, LIMIT_AGENT_DETAIL_CHARS, false)?;
+        let options = validate_text("options", options, 1, LIMIT_AGENT_DETAIL_CHARS, false)?;
+        let now = self.clock.now_ms();
+        let conn = self.lock()?;
+        require_agent_run(&conn, run_id)?;
+        conn.execute(
+            "INSERT INTO agent_permission_requests \
+                 (id, run_id, title, detail, options, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, run_id, title, detail, options, now],
+        )?;
+        read_permission_request(&conn, &id)
+    }
+
+    /// First answer wins. A late cancel cannot overwrite what the user chose,
+    /// and an allow can never overwrite a recorded denial.
+    pub fn resolve_permission_request(
+        &self,
+        id: &str,
+        resolution: AgentPermissionResolution,
+    ) -> Result<AgentPermissionRecord, AppError> {
+        let now = self.clock.now_ms();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE agent_permission_requests SET resolved_at = COALESCE(resolved_at, ?2), \
+             resolution = COALESCE(resolution, ?3) WHERE id = ?1",
+            params![id, now, resolution.as_record()],
+        )?;
+        if changed == 0 {
+            return Err(AppError::not_found("agent_permission_request", id));
+        }
+        read_permission_request(&conn, id)
+    }
+
+    pub fn get_permission_request(&self, id: &str) -> Result<AgentPermissionRecord, AppError> {
+        let conn = self.lock()?;
+        read_permission_request(&conn, id)
+    }
+
     // --- review inbox -------------------------------------------------------
 
     pub fn add_review_item(
@@ -490,6 +979,31 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// How many results are waiting to be looked at, per thread.
+    ///
+    /// This is what keeps a thread actionable after an agent produces something
+    /// new: the thread's own `seen_at`/`reviewed_at` record what a human did and
+    /// when, and are never rewritten by an agent, so the unread signal has to
+    /// come from the items themselves.
+    pub fn unseen_review_counts(&self) -> Result<Vec<UnseenReviewCount>, AppError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT thread_id, COUNT(*) FROM review_items WHERE seen_at IS NULL \
+             GROUP BY thread_id ORDER BY thread_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(UnseenReviewCount {
+                thread_id: r.get(0)?,
+                unseen: r.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
@@ -618,6 +1132,75 @@ fn read_review_item(conn: &Connection, id: &str) -> Result<ReviewItem, AppError>
     conn.query_row(&sql, params![id], map_review_item)
         .optional()?
         .ok_or_else(|| AppError::not_found("review_item", id))
+}
+
+fn require_agent_run(conn: &Connection, run_id: &str) -> Result<(), AppError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM agent_runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::not_found("agent_run", run_id))
+}
+
+fn read_agent_run(conn: &Connection, run_id: &str) -> Result<AgentRun, AppError> {
+    let sql = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE run_id = ?1");
+    conn.query_row(&sql, params![run_id], map_agent_run)
+        .optional()?
+        .ok_or_else(|| AppError::not_found("agent_run", run_id))
+}
+
+fn read_permission_request(conn: &Connection, id: &str) -> Result<AgentPermissionRecord, AppError> {
+    let sql =
+        format!("SELECT {AGENT_PERMISSION_COLS} FROM agent_permission_requests WHERE id = ?1");
+    conn.query_row(&sql, params![id], map_permission_request)
+        .optional()?
+        .ok_or_else(|| AppError::not_found("agent_permission_request", id))
+}
+
+fn map_agent_run(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
+    Ok(AgentRun {
+        run_id: row.get(0)?,
+        session_id: row.get(1)?,
+        program: row.get(2)?,
+        cwd: row.get(3)?,
+        acp_session_id: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        outcome: row.get(7)?,
+    })
+}
+
+fn map_agent_message(row: &Row<'_>) -> rusqlite::Result<AgentMessage> {
+    Ok(AgentMessage {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        key: row.get(2)?,
+        role: row.get(3)?,
+        turn: row.get(4)?,
+        body: row.get(5)?,
+        detail: row.get(6)?,
+        status: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn map_permission_request(row: &Row<'_>) -> rusqlite::Result<AgentPermissionRecord> {
+    Ok(AgentPermissionRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        title: row.get(2)?,
+        detail: row.get(3)?,
+        options: row.get(4)?,
+        created_at: row.get(5)?,
+        resolved_at: row.get(6)?,
+        resolution: row.get(7)?,
+    })
 }
 
 fn map_thread(row: &Row<'_>) -> rusqlite::Result<Thread> {
