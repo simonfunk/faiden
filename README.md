@@ -130,12 +130,12 @@ A handoff is a human-authored briefing, composed locally and deterministically.
   explicit press of Send, and edits made in the composer are what get sent.
 - **A retry never reuses the wrong text.** If a start is rejected and you then
   edit the draft, Faiden closes the record it had created and makes a fresh one
-  carrying the corrected text and lineage; an unchanged retry reuses the record
-  it already made rather than leaving a duplicate.
+  carrying the corrected text and lineage; an unchanged retry reuses an open record, but creates a fresh same-thread
+  record when native startup has already ended the previous one.
 - A start is **blocked** while the thread still owns a live agent: Faiden never
   interrupts a running session for you. Viewing, saving or starting sends
-  nothing; a rejected start keeps the draft on screen and retries into the same
-  session rather than leaving a second one behind.
+  nothing; a rejected start keeps the draft on screen. Retry preserves the reviewed
+  text and predecessor without attempting to restart an ended session.
 
 ## Development
 
@@ -205,6 +205,10 @@ Quit the existing app before replacing its installed bundle. Do not install anot
 See [CONCEPT.md](CONCEPT.md), the [foundation plan](docs/plans/0001-foundation.md)
 and the [Hermes ACP plan](docs/plans/0002-hermes-acp.md).
 
-## Publication status
+## Open source and contributing
 
-Local development repository; public GitHub publication is planned, but has not happened. The open-source license, distribution signing and release workflow are still to be selected. No open-source license grant is implied until a LICENSE is added.
+Faiden is developed at [simonfunk/faiden](https://github.com/simonfunk/faiden) under the [MIT License](LICENSE). You may use, modify, and redistribute it, including commercially, subject to the license terms. Third-party dependencies retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Contributions are welcome! Start with [CONTRIBUTING.md](CONTRIBUTING.md), open a focused bug report or feature proposal, and follow our [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+This is an independent early-stage project, not an official Hermes/Nous Research product. Signed/notarized releases are not yet available.

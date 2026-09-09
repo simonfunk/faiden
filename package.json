@@ -1,6 +1,10 @@
 {
   "name": "faiden",
   "private": true,
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/simonfunk/faiden.git" },
+  "homepage": "https://github.com/simonfunk/faiden",
+  "bugs": "https://github.com/simonfunk/faiden/issues",
   "version": "0.1.0",
   "type": "module",
   "description": "Faiden — the agent-first terminal. Thread-first local desktop terminal.",
